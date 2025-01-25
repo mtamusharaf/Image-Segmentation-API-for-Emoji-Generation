@@ -1,0 +1,163 @@
+from typing import Literal, Optional
+from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from fastapi.responses import FileResponse
+import os
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+import numpy as np
+import threading
+from PIL import Image
+from io import BytesIO
+import torch
+from transformers import AutoModelForImageSegmentation
+from torchvision import transforms
+from queue import Queue
+import logging
+from collections import defaultdict
+import time
+import os
+import uuid
+# Create the logs directory if it doesn't exist
+log_directory = './logs'
+os.makedirs(log_directory, exist_ok=True)
+
+# Create a logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)  # Log all messages with level INFO and above
+
+# Create file handler to log to a file
+file_handler = logging.FileHandler(f"{log_directory}/app.log")
+file_handler.setLevel(logging.INFO)  # Set the log level for the file handler
+file_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_format)
+logger.addHandler(file_handler)
+
+# Load authorized keys from a file
+def load_authorized_keys(file_path="authorized_keys.txt"):
+    try:
+        with open(file_path, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    except FileNotFoundError:
+        return set()
+
+FOLDER = "images"
+AUTHORIZED_KEYS = load_authorized_keys()
+# Token hit count
+token_hits = defaultdict(int)
+
+# Initialize FastAPI app
+app = FastAPI()
+
+# Model setup (dummy model and configuration)
+model = AutoModelForImageSegmentation.from_pretrained('briaai/RMBG-2.0', trust_remote_code=True)
+torch.set_float32_matmul_precision(['high', 'highest'][0])
+model.to('cuda')
+model.eval()
+
+# Global settings
+image_size = (1024, 1024)
+mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).cuda()
+std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).cuda()
+
+# Global queue to manage image generation requests
+task_queue = Queue()
+
+# Lock to ensure GPU is accessed by only one thread at a time
+gpu_lock = threading.Lock()
+
+# Dependency to check Authorization header
+def verify_token(authorization: str = Header(None)):
+    if not authorization:
+        logging.info("No Authorization header provided, using default token 'test'")
+        token = "test"
+        token_hits[token] += 1
+        logging.info(f"Token '{token}' hit count: {token_hits[token]}")
+        return token
+    
+    try:
+        scheme, token = authorization.split()
+        if scheme.lower() != "bearer" or token not in AUTHORIZED_KEYS:
+            raise HTTPException(status_code=403, detail="Invalid token")
+        # Increment hit count for this token
+        token_hits[token] += 1
+        logging.info(f"Token '{token}' hit count: {token_hits[token]}")
+        return token
+    
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid Authorization header format")
+    
+# Worker thread function to process the image
+def process_image(args, token):
+    """
+    This function runs in a background thread to process the image.
+    It processes the request and returns the result as a BytesIO object.
+    """
+    # Acquire the GPU lock to ensure only one worker is using the GPU at a time
+    start_time = time.time()
+    
+    with gpu_lock:
+        res_tensor, result = app.state.model.generate(**args)
+
+        # Image processing code
+        if isinstance(result, BytesIO):
+            image = Image.open(result)
+        else:
+            image = Image.open(BytesIO(result))
+
+        input_images = (res_tensor - mean) / std
+        print(input_images.shape)
+        with torch.no_grad():
+            preds = model(input_images)[-1].sigmoid().cpu()
+
+        pred = preds[0].squeeze()
+        pred_pil = transforms.ToPILImage()(pred)
+        mask = pred_pil.resize(image.size)
+        image.putalpha(mask)
+
+        img_uuid = uuid.uuid4()
+        image.save(f'{FOLDER}/{img_uuid}.png', format="PNG")
+        
+        duration = time.time() - start_time
+        logging.info(f"Token: {token} (Time taken: {duration:.2f}s)")
+        logging.info(f"Request arguments: {args}")
+        logging.info("-----------------")
+
+        return f"http://api.vsearchai.com:32413/{FOLDER}/{img_uuid}.png"
+
+# Endpoint for generating the image
+class GenerateArgs(BaseModel):
+    prompt: str
+    guidance: Optional[float] = Field(default=3.5)
+    seed: Optional[int] = Field(default_factory=lambda: np.random.randint(0, 2**32 - 1), gt=0, lt=2**32 - 1)
+    strength: Optional[float] = 1.0
+
+@app.post("/genemoji")
+async def genemoji(args: GenerateArgs, token: str = Depends(verify_token)):
+    """
+    Endpoint for generating an Emoji
+    """
+    # Add the request to the task queue
+    task_queue.put(args.dict())
+
+    # Wait for the image to be generated by the worker
+    while not task_queue.empty():
+        current_args = task_queue.get()
+        result_image_url = process_image(current_args, token)
+    # Return the image as a StreamingResponse
+    return JSONResponse({"imageURL": result_image_url})
+
+@app.get("/images/{filename}")
+async def serve_image(filename: str):
+    """
+    Serves an image file from the specified folder.
+    """
+    file_path = os.path.join(FOLDER, filename)
+    
+    # Check if the file exists
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Image not found")
+    
+    # Return the file
+    return FileResponse(file_path)
